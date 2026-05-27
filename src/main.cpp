@@ -6,11 +6,13 @@
 // ========== 配置区 ==========
 #define SERIAL_BAUD 115200  // 串口波特率
 #define STATUS_LED 2  // GPIO2，低电平点亮  // 状态指示灯引脚
-#define HEARTBEAT_INTERVAL 10000UL  // 默认心跳间隔（毫秒）
+#define HEARTBEAT_INTERVAL 2000UL  // 默认心跳间隔（毫秒）
 #define WIFI_RECONNECT_INTERVAL 5000UL  // WiFi 重连间隔（毫秒）
 #define DATA_FRAME_START1 0xAA  // 数据帧起始字节1
 #define DATA_FRAME_START2 0x55  // 数据帧起始字节2
 #define DATA_PAYLOAD_LEN 9  // 数据载荷长度（温度2 + 湿度2 + 光照2 + 火焰1 + 烟雾2）
+#define ALARM_FRAME_HEADER 0xEE  // 报警灯帧头
+#define ALARM_DEVICE_ID 2  // 报警灯设备ID
 
 struct SensorRecord {  // 传感器数据结构
   float temperature;  // 温度（摄氏度）
@@ -229,6 +231,12 @@ void readSensorSerial() {  // 读取传感器串口数据
   }
 }
 
+void sendAlarmToMCU() {  // 向MCU发送报警灯触发帧: 0xEE 0x01 0xFE
+  uint8_t frame[3] = { ALARM_FRAME_HEADER, 0x01, (uint8_t)(0x01 ^ 0xFF) };  // 帧头 + CMD + ~CMD
+  Serial.write(frame, 3);  // 通过串口发给MCU
+  Serial.println("[ALARM] sent to MCU: EE 01 FE");  // 日志
+}
+
 // ========== TCP/UDP 传输 ==========
 bool ensureTcpConnected() {  // 确保TCP连接
   if (tcpClient.connected()) return true;  // 已连接直接返回
@@ -274,6 +282,16 @@ void periodicSend() {  // 周期性发送数据
 }
 
 // ========== WiFi 连接管理 ==========
+void updateBroadcastIP() {  // 根据当前网络自动计算正确的广播地址
+  IPAddress local = WiFi.localIP();  // 获取本机IP
+  IPAddress mask = WiFi.subnetMask();  // 获取子网掩码
+  conf.serverIP = IPAddress(
+    (uint32_t)local | ~(uint32_t)mask  // 计算广播地址: localIP | ~subnetMask
+  );
+  Serial.printf("[WIFI] auto broadcast -> %s\n", conf.serverIP.toString().c_str());  // 打印广播地址
+  conf.udpPort = conf.tcpPort;  // 同步端口
+}
+
 void connectWiFi() {  // 连接WiFi
   if (WiFi.isConnected()) return;  // 已连接则返回
   Serial.printf("[WIFI] connecting %s ...\n", conf.ssid.c_str());  // 连接日志
@@ -289,11 +307,17 @@ void checkWiFi() {  // 检查WiFi连接状态
   if (millis() - lastWiFiCheck < WIFI_RECONNECT_INTERVAL) return;  // 未到检查时间返回
   lastWiFiCheck = millis();  // 更新检查时间
 
+  static bool wasDisconnected = true;  // 跟踪连接状态变化
   if (!WiFi.isConnected()) {  // 如果未连接
     connectWiFi();  // 尝试连接
+    wasDisconnected = true;  // 标记为断开
     setStatusLED(false);  // 熄灭LED
   } else {
     setStatusLED(true);  // 点亮LED
+    if (wasDisconnected) {  // 刚连上
+      updateBroadcastIP();  // 自动计算广播地址
+      wasDisconnected = false;  // 标记为已连接
+    }
   }
 }
 
@@ -345,8 +369,11 @@ void loop() {  // 主循环
       String down = tcpClient.readStringUntil('\n');  // 读取下行数据
       if (down.length() > 0) {  // 如果有数据
         Serial.println("[DOWN] " + down);  // 打印下行数据
-        // 下行命令示例：SET MODE UDP 或 SET SERVER xxxx
-        processSerialCommand(down);  // 处理下行命令
+        if (down.indexOf("\"t\":\"alarm\"") >= 0) {  // 服务器下发报警指令
+          sendAlarmToMCU();  // 转发报警帧给MCU
+        } else {  // 否则作为配置命令处理
+          processSerialCommand(down);  // 处理下行命令
+        }
       }
     }
   }
